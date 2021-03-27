@@ -922,7 +922,7 @@ fn internal_churn(unreliable: bool) {
         } else {
             tx.send(None).unwrap();
         }
-    };
+    }
 
     let ncli = 3;
     let mut nrec = vec![];
