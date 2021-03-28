@@ -86,9 +86,7 @@ impl Node {
 
     pub fn get_state(&self) -> raft::State {
         // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        raft::State::default()
     }
 }
 

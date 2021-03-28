@@ -1,7 +1,13 @@
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
+};
 
-use futures::channel::mpsc::UnboundedSender;
+use futures::{
+    channel::mpsc::UnboundedSender, executor::ThreadPool, prelude::*, select,
+    stream::FuturesUnordered,
+};
 
 #[cfg(test)]
 pub mod config;
@@ -21,10 +27,23 @@ pub struct ApplyMsg {
 }
 
 /// State of a raft peer.
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
-    pub term: u64,
-    pub is_leader: bool,
+    term: u64,
+    role: Role,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+impl Default for Role {
+    fn default() -> Self {
+        Role::Follower
+    }
 }
 
 impl State {
@@ -34,7 +53,7 @@ impl State {
     }
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        self.is_leader
+        matches!(self.role, Role::Leader)
     }
 }
 
@@ -50,10 +69,11 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     apply_ch: UnboundedSender<ApplyMsg>,
+    this: Weak<Mutex<Self>>,
+    runtime: ThreadPool,
 
-    state: RaftState,
+    state: State,
     // State Persistent state on all servers
-    term: u64,
     voted_for: Option<usize>,
     log: Vec<Log>,
     // Volatile state on all servers
@@ -62,14 +82,8 @@ pub struct Raft {
     // Volatile state on leaders
     next_index: Vec<usize>,
     match_index: Vec<usize>,
-}
 
-/// Raft server state.
-#[derive(Debug, PartialEq, Eq)]
-enum RaftState {
-    Follower,
-    Candidate,
-    Leader,
+    last_apply_entries_received: Instant,
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -92,28 +106,36 @@ impl Raft {
         me: usize,
         persister: Box<dyn Persister>,
         apply_ch: UnboundedSender<ApplyMsg>,
-    ) -> Raft {
+    ) -> Arc<Mutex<Raft>> {
         let raft_state = persister.raft_state();
         let n = peers.len();
 
         // Your initialization code here (2A, 2B, 2C).
-        let mut rf = Raft {
+        let mut rf = Arc::new(Mutex::new(Raft {
             peers,
             persister,
             me,
             apply_ch,
-            state: RaftState::Follower,
-            term: 0,
+            this: Weak::default(),
+            runtime: ThreadPool::new().unwrap(),
+            state: State::default(),
             voted_for: None,
             log: vec![Log::default()],
             commit_idx: 0,
             last_applied: 0,
             next_index: vec![0; n],
             match_index: vec![0; n],
-        };
+            last_apply_entries_received: Instant::now(),
+        }));
+
+        let mut raft = rf.lock().unwrap();
+        raft.this = Arc::downgrade(&rf);
+        raft.spawn_follower_timer();
 
         // initialize from state persisted before a crash
-        rf.restore(&raft_state);
+        raft.restore(&raft_state);
+        info!("{:?} created", raft);
+        drop(raft);
 
         rf
     }
@@ -148,44 +170,6 @@ impl Raft {
         // }
     }
 
-    /// example code to send a RequestVote RPC to a server.
-    /// server is the index of the target server in peers.
-    /// expects RPC arguments in args.
-    ///
-    /// The labrpc package simulates a lossy network, in which servers
-    /// may be unreachable, and in which requests and replies may be lost.
-    /// This method sends a request and waits for a reply. If a reply arrives
-    /// within a timeout interval, This method returns Ok(_); otherwise
-    /// this method returns Err(_). Thus this method may not return for a while.
-    /// An Err(_) return can be caused by a dead server, a live server that
-    /// can't be reached, a lost request, or a lost reply.
-    ///
-    /// This method is guaranteed to return (perhaps after a delay) *except* if
-    /// the handler function on the server side does not return.  Thus there
-    /// is no need to implement your own timeouts around this method.
-    ///
-    /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(
-        &self,
-        server: usize,
-        args: RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
-        // Your code here if you want the rpc becomes async.
-        // Example:
-        // ```
-        // let peer = &self.peers[server];
-        // let peer_clone = peer.clone();
-        // let (tx, rx) = channel();
-        // peer.spawn(async move {
-        //     let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-        //     tx.send(res);
-        // });
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
-    }
-
     fn start(&self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
         let index = 0;
         let term = 0;
@@ -199,6 +183,144 @@ impl Raft {
         } else {
             Err(Error::NotLeader)
         }
+    }
+
+    fn transfer_state(&mut self, term: u64, role: Role) {
+        assert!(term >= self.state.term);
+        info!("{:?} => t={},{:?}", self, term, role);
+        if term > self.state.term {
+            self.voted_for = None;
+        }
+        self.state = State { term, role };
+        match role {
+            Role::Follower => {
+                self.spawn_follower_timer();
+            }
+            Role::Candidate => {
+                self.voted_for = Some(self.me);
+                self.spawn_candidate_task();
+            }
+            Role::Leader => {
+                self.next_index.fill(0);
+                self.match_index.fill(0);
+                self.spawn_leader_heartbeat();
+            }
+        }
+    }
+
+    fn spawn_follower_timer(&self) {
+        let this = self.this.clone();
+        let state = self.state;
+        let timeout = Self::generate_follower_timeout();
+        self.runtime.spawn_ok(async move {
+            while let Some(this) = this.upgrade() {
+                let deadline = {
+                    let mut this = this.lock().unwrap();
+                    if this.state != state {
+                        return;
+                    }
+                    if this.last_apply_entries_received.elapsed() > timeout {
+                        info!("{:?} timeout", *this);
+                        this.transfer_state(state.term + 1, Role::Candidate);
+                        return;
+                    }
+                    this.last_apply_entries_received + timeout
+                };
+                sleep_until(deadline).await;
+            }
+        });
+    }
+
+    fn spawn_candidate_task(&self) {
+        let this = self.this.clone();
+        let state = self.state;
+        let args = RequestVoteArgs {
+            term: self.state.term,
+            candidate_id: self.me as u64,
+            last_log_index: self.log.len() as u64 - 1,
+            last_log_term: self.log.last().unwrap().term,
+        };
+        info!("{:?} -> {:?}", self, args);
+        let mut rpcs = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != self.me)
+            .map(|(_, peer)| peer.clone().request_vote(&args))
+            .collect::<FuturesUnordered<_>>();
+        let deadline = Instant::now() + Self::generate_candidate_timeout();
+        let min_vote = (self.peers.len() + 1) / 2;
+        self.runtime.spawn_ok(async move {
+            let mut vote_count = 1;
+            while let Some(this) = this.upgrade() {
+                enum Event {
+                    Reply(RequestVoteReply),
+                    RpcError,
+                    AllComplete,
+                    Timeout,
+                }
+                let event = select! {
+                    _ = sleep_until(deadline).fuse() => Event::Timeout,
+                    ret = rpcs.next() => match ret {
+                        None => Event::AllComplete,
+                        Some(Ok(reply)) => Event::Reply(reply),
+                        Some(Err(_)) => Event::RpcError,
+                    }
+                };
+                let mut this = this.lock().unwrap();
+                if this.state != state {
+                    return;
+                }
+                match event {
+                    Event::Reply(reply) => {
+                        assert!(reply.term >= state.term);
+                        if reply.term > state.term {
+                            this.transfer_state(reply.term, Role::Follower);
+                            return;
+                        }
+                        if reply.vote_granted {
+                            vote_count += 1;
+                            if vote_count >= min_vote {
+                                this.transfer_state(state.term, Role::Leader);
+                            }
+                            return;
+                        }
+                    }
+                    Event::RpcError => {}
+                    Event::Timeout => {
+                        this.transfer_state(state.term + 1, Role::Candidate);
+                        return;
+                    }
+                    Event::AllComplete => return,
+                }
+            }
+        });
+    }
+
+    fn spawn_leader_heartbeat(&self) {
+        todo!()
+    }
+
+    fn generate_follower_timeout() -> Duration {
+        Duration::from_millis(100 + rand::random::<u64>() % 200)
+    }
+
+    fn generate_candidate_timeout() -> Duration {
+        Duration::from_millis(300)
+    }
+}
+
+async fn sleep_until(deadline: Instant) {
+    futures_timer::Delay::new(deadline.duration_since(Instant::now())).await;
+}
+
+impl fmt::Debug for Raft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Raft({},t={},{:?})",
+            self.me, self.state.term, self.state.role
+        )
     }
 }
 
@@ -224,11 +346,9 @@ pub struct Node {
 
 impl Node {
     /// Create a new raft service.
-    pub fn new(raft: Raft) -> Node {
+    pub fn new(raft: Arc<Mutex<Raft>>) -> Node {
         // Your code here.
-        Node {
-            raft: Arc::new(Mutex::new(raft)),
-        }
+        Node { raft }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -253,22 +373,20 @@ impl Node {
     pub fn term(&self) -> u64 {
         // Your code here.
         let raft = self.raft.lock().unwrap();
-        raft.term
+        raft.state.term
     }
 
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
         // Your code here.
         let raft = self.raft.lock().unwrap();
-        matches!(raft.state, RaftState::Leader)
+        raft.state.is_leader()
     }
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
-        }
+        let raft = self.raft.lock().unwrap();
+        raft.state.clone()
     }
 
     /// the tester calls kill() when a Raft instance won't be
@@ -291,7 +409,36 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        let mut this = self.raft.lock().unwrap();
+        // Reply false if term < currentTerm (§5.1)
+        if args.term < this.state.term {
+            return Ok(RequestVoteReply {
+                term: this.state.term,
+                vote_granted: false,
+            });
+        } else if args.term > this.state.term {
+            this.transfer_state(args.term, Role::Follower);
+        }
+        // If votedFor is null or candidateId, and candidate’s log is at least
+        // as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+        let can_vote =
+            this.voted_for.is_none() || this.voted_for == Some(args.candidate_id as usize);
+        let log_up_to_date = (args.last_log_term, args.last_log_index)
+            >= (this.log.last().unwrap().term, this.log.len() as u64 - 1);
+        let vote_granted = can_vote && log_up_to_date;
+        if vote_granted {
+            this.voted_for = Some(args.candidate_id as usize);
+        }
+        info!(
+            "{:?} <- {} {:?}",
+            *this,
+            if vote_granted { "accept" } else { "deny" },
+            args
+        );
+        Ok(RequestVoteReply {
+            term: this.state.term,
+            vote_granted,
+        })
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
