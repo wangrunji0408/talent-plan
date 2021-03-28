@@ -1,12 +1,11 @@
+use futures::{
+    channel::mpsc::UnboundedSender, executor::ThreadPool, prelude::*, select,
+    stream::FuturesUnordered,
+};
 use std::{
     fmt,
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
-};
-
-use futures::{
-    channel::mpsc::UnboundedSender, executor::ThreadPool, prelude::*, select,
-    stream::FuturesUnordered,
 };
 
 #[cfg(test)]
@@ -19,6 +18,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use crate::raft::append_entries_args::Log;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -77,19 +77,13 @@ pub struct Raft {
     voted_for: Option<usize>,
     log: Vec<Log>,
     // Volatile state on all servers
-    commit_idx: usize,
+    commit_index: usize,
     last_applied: usize,
     // Volatile state on leaders
     next_index: Vec<usize>,
     match_index: Vec<usize>,
 
     last_apply_entries_received: Instant,
-}
-
-#[derive(Debug, PartialEq, Eq, Default)]
-struct Log {
-    term: u64,
-    command: Vec<u8>,
 }
 
 impl Raft {
@@ -111,7 +105,7 @@ impl Raft {
         let n = peers.len();
 
         // Your initialization code here (2A, 2B, 2C).
-        let mut rf = Arc::new(Mutex::new(Raft {
+        let rf = Arc::new(Mutex::new(Raft {
             peers,
             persister,
             me,
@@ -121,7 +115,7 @@ impl Raft {
             state: State::default(),
             voted_for: None,
             log: vec![Log::default()],
-            commit_idx: 0,
+            commit_index: 0,
             last_applied: 0,
             next_index: vec![0; n],
             match_index: vec![0; n],
@@ -185,15 +179,16 @@ impl Raft {
         }
     }
 
-    fn transfer_state(&mut self, term: u64, role: Role) {
+    fn transfer_state(&mut self, term: u64, role: Role, reason: &str) {
         assert!(term >= self.state.term);
-        info!("{:?} => t={},{:?}", self, term, role);
+        info!("{:?} {} => t={},{:?}", self, reason, term, role);
         if term > self.state.term {
             self.voted_for = None;
         }
         self.state = State { term, role };
         match role {
             Role::Follower => {
+                self.last_apply_entries_received = Instant::now();
                 self.spawn_follower_timer();
             }
             Role::Candidate => {
@@ -201,9 +196,9 @@ impl Raft {
                 self.spawn_candidate_task();
             }
             Role::Leader => {
-                self.next_index.fill(0);
+                self.next_index.fill(self.log.len());
                 self.match_index.fill(0);
-                self.spawn_leader_heartbeat();
+                self.spawn_leader_append_entries();
             }
         }
     }
@@ -211,7 +206,7 @@ impl Raft {
     fn spawn_follower_timer(&self) {
         let this = self.this.clone();
         let state = self.state;
-        let timeout = Self::generate_follower_timeout();
+        let timeout = Self::generate_election_timeout();
         self.runtime.spawn_ok(async move {
             while let Some(this) = this.upgrade() {
                 let deadline = {
@@ -220,8 +215,7 @@ impl Raft {
                         return;
                     }
                     if this.last_apply_entries_received.elapsed() > timeout {
-                        info!("{:?} timeout", *this);
-                        this.transfer_state(state.term + 1, Role::Candidate);
+                        this.transfer_state(state.term + 1, Role::Candidate, "election timeout");
                         return;
                     }
                     this.last_apply_entries_received + timeout
@@ -240,7 +234,7 @@ impl Raft {
             last_log_index: self.log.len() as u64 - 1,
             last_log_term: self.log.last().unwrap().term,
         };
-        info!("{:?} -> {:?}", self, args);
+        debug!("{:?} -> {:?}", self, args);
         let mut rpcs = self
             .peers
             .iter()
@@ -248,7 +242,7 @@ impl Raft {
             .filter(|&(idx, _)| idx != self.me)
             .map(|(_, peer)| peer.clone().request_vote(&args))
             .collect::<FuturesUnordered<_>>();
-        let deadline = Instant::now() + Self::generate_candidate_timeout();
+        let deadline = Instant::now() + Self::generate_election_timeout();
         let min_vote = (self.peers.len() + 1) / 2;
         self.runtime.spawn_ok(async move {
             let mut vote_count = 1;
@@ -275,38 +269,88 @@ impl Raft {
                     Event::Reply(reply) => {
                         assert!(reply.term >= state.term);
                         if reply.term > state.term {
-                            this.transfer_state(reply.term, Role::Follower);
+                            this.transfer_state(reply.term, Role::Follower, "higher term (->RV)");
                             return;
                         }
                         if reply.vote_granted {
                             vote_count += 1;
                             if vote_count >= min_vote {
-                                this.transfer_state(state.term, Role::Leader);
+                                this.transfer_state(state.term, Role::Leader, "win election");
                             }
                             return;
                         }
                     }
                     Event::RpcError => {}
                     Event::Timeout => {
-                        this.transfer_state(state.term + 1, Role::Candidate);
+                        this.transfer_state(state.term + 1, Role::Candidate, "election timeout");
                         return;
                     }
-                    Event::AllComplete => return,
+                    Event::AllComplete => {}
                 }
             }
         });
     }
 
-    fn spawn_leader_heartbeat(&self) {
-        todo!()
+    fn spawn_leader_append_entries(&self) {
+        for (i, peer) in self.peers.iter().enumerate() {
+            if i == self.me {
+                continue;
+            }
+            let weak = self.this.clone();
+            let state = self.state;
+            let leader_id = self.me as u64;
+            let peer = peer.clone();
+            self.runtime.spawn_ok(async move {
+                while let Some(this) = weak.upgrade() {
+                    let (match_index_if_success, args) = {
+                        let this = this.lock().unwrap();
+                        if this.state != state {
+                            return;
+                        }
+                        let next_index = this.next_index[i];
+                        let prev_log_index = next_index - 1;
+                        let args = AppendEntriesArgs {
+                            term: state.term,
+                            leader_id,
+                            prev_log_index: prev_log_index as u64,
+                            prev_log_term: this.log[prev_log_index].term,
+                            entries: vec![],
+                            leader_commit: this.commit_index as u64,
+                        };
+                        debug!("{:?} ->{} {:?}", *this, i, args);
+                        (prev_log_index + args.entries.len(), args)
+                    };
+                    let reply = select! {
+                        ret = peer.append_entries(&args).fuse() => match ret {
+                            Err(_) => continue,
+                            Ok(x) => x,
+                        },
+                        _ = futures_timer::Delay::new(Self::generate_heartbeat_interval()).fuse() => continue,
+                    };
+                    {
+                        let mut this = this.lock().unwrap();
+                        if reply.term > this.state.term {
+                            this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
+                        }
+                        if this.state != state {
+                            return;
+                        }
+                        if reply.success {
+                            this.match_index[i] = match_index_if_success;
+                        }
+                    }
+                    futures_timer::Delay::new(Self::generate_heartbeat_interval()).await;
+                }
+            });
+        }
     }
 
-    fn generate_follower_timeout() -> Duration {
-        Duration::from_millis(100 + rand::random::<u64>() % 200)
+    fn generate_election_timeout() -> Duration {
+        Duration::from_millis(150 + rand::random::<u64>() % 150)
     }
 
-    fn generate_candidate_timeout() -> Duration {
-        Duration::from_millis(300)
+    fn generate_heartbeat_interval() -> Duration {
+        Duration::from_millis(50)
     }
 }
 
@@ -318,7 +362,7 @@ impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Raft({},t={},{:?})",
+            "Raft({},t={:>2},{:?})",
             self.me, self.state.term, self.state.role
         )
     }
@@ -412,12 +456,16 @@ impl RaftService for Node {
         let mut this = self.raft.lock().unwrap();
         // Reply false if term < currentTerm (§5.1)
         if args.term < this.state.term {
+            debug!("{:?} <- deny {:?}", *this, args);
             return Ok(RequestVoteReply {
                 term: this.state.term,
                 vote_granted: false,
             });
-        } else if args.term > this.state.term {
-            this.transfer_state(args.term, Role::Follower);
+        }
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower (§5.1)
+        if args.term > this.state.term {
+            this.transfer_state(args.term, Role::Follower, "higher term (<-RV)");
         }
         // If votedFor is null or candidateId, and candidate’s log is at least
         // as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
@@ -429,7 +477,7 @@ impl RaftService for Node {
         if vote_granted {
             this.voted_for = Some(args.candidate_id as usize);
         }
-        info!(
+        debug!(
             "{:?} <- {} {:?}",
             *this,
             if vote_granted { "accept" } else { "deny" },
@@ -442,6 +490,55 @@ impl RaftService for Node {
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
-        crate::your_code_here(args)
+        let mut this = self.raft.lock().unwrap();
+        // Reply false if term < currentTerm (§5.1)
+        if args.term < this.state.term {
+            debug!("{:?} <- deny {:?}", *this, args);
+            return Ok(AppendEntriesReply {
+                term: this.state.term,
+                success: false,
+            });
+        }
+        // If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower (§5.1)
+        if args.term > this.state.term {
+            this.transfer_state(args.term, Role::Follower, "higher term (<-AE)");
+        }
+        this.last_apply_entries_received = Instant::now();
+        // Reply false if log doesn’t contain an entry at prevLogIndex
+        // whose term matches prevLogTerm (§5.3)
+        if !matches!(this.log.get(args.prev_log_index as usize), Some(log) if log.term == args.prev_log_term)
+        {
+            debug!("{:?} <- deny {:?}", *this, args);
+            return Ok(AppendEntriesReply {
+                term: this.state.term,
+                success: false,
+            });
+        }
+        // If an existing entry conflicts with a new one (same index but different terms),
+        // delete the existing entry and all that follow it (§5.3)
+        let log_offset = args.prev_log_index as usize + 1;
+        if let Some(idx) = args
+            .entries
+            .iter()
+            .zip(this.log[log_offset..].iter())
+            .position(|(remote, local)| remote.term != local.term)
+        {
+            this.log.truncate(log_offset + idx);
+        }
+        // Append any new entries not already in the log
+        if log_offset + args.entries.len() > this.log.len() {
+            let new_logs = &args.entries[this.log.len() - log_offset..];
+            this.log.extend_from_slice(new_logs);
+        }
+        // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        if args.leader_commit as usize > this.commit_index {
+            this.commit_index = (args.leader_commit as usize).min(this.log.len() - 1);
+        }
+        debug!("{:?} <- accept {:?}", *this, args);
+        Ok(AppendEntriesReply {
+            term: this.state.term,
+            success: true,
+        })
     }
 }
