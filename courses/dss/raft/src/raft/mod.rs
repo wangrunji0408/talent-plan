@@ -18,7 +18,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use crate::raft::append_entries_args::Log;
+use crate::raft::{Log, Persist};
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -71,6 +71,7 @@ pub struct Raft {
     apply_ch: UnboundedSender<ApplyMsg>,
     this: Weak<Mutex<Self>>,
     runtime: ThreadPool,
+    killed: bool,
 
     state: State,
     // State Persistent state on all servers
@@ -84,6 +85,25 @@ pub struct Raft {
     match_index: Vec<usize>,
 
     last_apply_entries_received: Instant,
+}
+
+macro_rules! try_upgrade {
+    ($weak:expr) => {
+        match $weak.upgrade() {
+            Some(t) => t,
+            None => return,
+        }
+    };
+}
+
+macro_rules! lock_and_check_raft {
+    ($this:expr, $state:expr) => {{
+        let lock = $this.lock().unwrap();
+        if lock.state != $state || lock.killed {
+            return;
+        }
+        lock
+    }};
 }
 
 impl Raft {
@@ -112,6 +132,7 @@ impl Raft {
             apply_ch,
             this: Weak::default(),
             runtime: ThreadPool::new().unwrap(),
+            killed: false,
             state: State::default(),
             voted_for: None,
             log: vec![Log::default()],
@@ -124,10 +145,9 @@ impl Raft {
 
         let mut raft = rf.lock().unwrap();
         raft.this = Arc::downgrade(&rf);
-        raft.spawn_follower_timer();
-
         // initialize from state persisted before a crash
         raft.restore(&raft_state);
+        raft.spawn_follower_timer();
         info!("{:?} created", raft);
         drop(raft);
 
@@ -139,10 +159,17 @@ impl Raft {
     /// see paper's Figure 2 for a description of what should be persistent.
     fn persist(&mut self) {
         // Your code here (2C).
-        // Example:
-        // labcodec::encode(&self.xxx, &mut data).unwrap();
-        // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let mut data = vec![];
+        let persist = Persist {
+            term: self.state.term,
+            voted_for: match self.voted_for {
+                Some(v) => v as i64,
+                None => -1,
+            },
+            log: self.log.clone(),
+        };
+        labcodec::encode(&persist, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -152,16 +179,13 @@ impl Raft {
             return;
         }
         // Your code here (2C).
-        // Example:
-        // match labcodec::decode(data) {
-        //     Ok(o) => {
-        //         self.xxx = o.xxx;
-        //         self.yyy = o.yyy;
-        //     }
-        //     Err(e) => {
-        //         panic!("{:?}", e);
-        //     }
-        // }
+        let persist = labcodec::decode::<Persist>(data).unwrap();
+        self.state.term = persist.term;
+        self.voted_for = match persist.voted_for {
+            -1 => None,
+            v => Some(v as usize),
+        };
+        self.log = persist.log;
     }
 
     fn start(&mut self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
@@ -174,8 +198,14 @@ impl Raft {
         let index = self.log.len() as u64;
         let term = self.state.term;
         self.log.push(Log { term, data });
+        self.persist();
         info!("{:?} start index {}", self, index);
         Ok((index, term))
+    }
+
+    fn kill(&mut self) {
+        self.killed = true;
+        info!("{:?} killed", self);
     }
 
     fn transfer_state(&mut self, term: u64, role: Role, reason: &str) {
@@ -200,6 +230,7 @@ impl Raft {
                 self.spawn_leader_append_entries();
             }
         }
+        self.persist();
     }
 
     fn spawn_follower_timer(&self) {
@@ -207,12 +238,10 @@ impl Raft {
         let state = self.state;
         let timeout = Self::generate_election_timeout();
         self.runtime.spawn_ok(async move {
-            while let Some(this) = this.upgrade() {
+            loop {
                 let deadline = {
-                    let mut this = this.lock().unwrap();
-                    if this.state != state {
-                        return;
-                    }
+                    let this = try_upgrade!(this);
+                    let mut this = lock_and_check_raft!(this, state);
                     if this.last_apply_entries_received.elapsed() > timeout {
                         this.transfer_state(state.term + 1, Role::Candidate, "election timeout");
                         return;
@@ -261,14 +290,8 @@ impl Raft {
                         Some(Err(_)) => Event::RpcError,
                     }
                 };
-                let this = match this.upgrade() {
-                    Some(t) => t,
-                    None => return,
-                };
-                let mut this = this.lock().unwrap();
-                if this.state != state {
-                    return;
-                }
+                let this = try_upgrade!(this);
+                let mut this = lock_and_check_raft!(this, state);
                 match event {
                     Event::Reply(reply) => {
                         assert!(reply.term >= state.term);
@@ -300,18 +323,16 @@ impl Raft {
             if i == self.me {
                 continue;
             }
-            let weak = self.this.clone();
+            let this = self.this.clone();
             let state = self.state;
             let leader_id = self.me as u64;
             let peer = peer.clone();
             self.runtime.spawn_ok(async move {
                 let mut backoff = 1;
-                while let Some(this) = weak.upgrade() {
+                loop {
                     let (match_index_if_success, args) = {
-                        let this = this.lock().unwrap();
-                        if this.state != state {
-                            return;
-                        }
+                        let this = try_upgrade!(this);
+                        let this = lock_and_check_raft!(this, state);
                         let next_index = this.next_index[i];
                         let prev_log_index = next_index - 1;
                         let args = AppendEntriesArgs {
@@ -333,12 +354,10 @@ impl Raft {
                         _ = futures_timer::Delay::new(Self::generate_heartbeat_interval()).fuse() => continue,
                     };
                     {
-                        let mut this = this.lock().unwrap();
+                        let this = try_upgrade!(this);
+                        let mut this = lock_and_check_raft!(this, state);
                         if reply.term > this.state.term {
                             this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
-                        }
-                        if this.state != state {
-                            return;
                         }
                         if reply.success {
                             this.next_index[i] = match_index_if_success + 1;
@@ -399,6 +418,12 @@ impl Raft {
 
 async fn sleep_until(deadline: Instant) {
     futures_timer::Delay::new(deadline.duration_since(Instant::now())).await;
+}
+
+impl Drop for Raft {
+    fn drop(&mut self) {
+        debug!("{:?} drop", self);
+    }
 }
 
 impl fmt::Debug for Raft {
@@ -489,6 +514,8 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let mut raft = self.raft.lock().unwrap();
+        raft.kill();
     }
 }
 
@@ -523,6 +550,7 @@ impl RaftService for Node {
         if vote_granted {
             this.voted_for = Some(args.candidate_id as usize);
         }
+        this.persist();
         debug!(
             "{:?} <- {} {:?}",
             *this,
@@ -582,6 +610,7 @@ impl RaftService for Node {
             let commit_index = (args.leader_commit as usize).min(this.log.len() - 1);
             this.update_commit(commit_index);
         }
+        this.persist();
         debug!("{:?} <- accept {:?}", *this, args);
         Ok(AppendEntriesReply {
             term: this.state.term,

@@ -18,6 +18,11 @@ message RequestVoteReply {
     bool vote_granted = 2;
 }
 
+message Log {
+    uint64 term = 1;
+    bytes data = 2;
+}
+
 message AppendEntriesArgs {
     uint64 term = 1;
     uint64 leader_id = 2;
@@ -25,14 +30,15 @@ message AppendEntriesArgs {
     uint64 prev_log_term = 4;
     repeated Log entries = 5;
     uint64 leader_commit = 6;
-
-    message Log {
-        uint64 term = 1;
-        bytes data = 2;
-    }
 }
 
 message AppendEntriesReply {
     uint64 term = 1;
     bool success = 2;
+}
+
+message Persist {
+    uint64 term = 1;
+    int64 voted_for = 2;
+    repeated Log log = 3;
 }
