@@ -164,19 +164,18 @@ impl Raft {
         // }
     }
 
-    fn start(&self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+    fn start(&mut self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
+        let mut data = vec![];
+        labcodec::encode(command, &mut data).map_err(Error::Encode)?;
         // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        if !self.state.is_leader() {
+            return Err(Error::NotLeader);
         }
+        let index = self.log.len() as u64;
+        let term = self.state.term;
+        self.log.push(Log { term, data });
+        info!("{:?} start", self);
+        Ok((index, term))
     }
 
     fn transfer_state(&mut self, term: u64, role: Role, reason: &str) {
@@ -246,7 +245,8 @@ impl Raft {
         let min_vote = (self.peers.len() + 1) / 2;
         self.runtime.spawn_ok(async move {
             let mut vote_count = 1;
-            while let Some(this) = this.upgrade() {
+            loop {
+                #[derive(Debug)]
                 enum Event {
                     Reply(RequestVoteReply),
                     RpcError,
@@ -260,6 +260,10 @@ impl Raft {
                         Some(Ok(reply)) => Event::Reply(reply),
                         Some(Err(_)) => Event::RpcError,
                     }
+                };
+                let this = match this.upgrade() {
+                    Some(t) => t,
+                    None => return,
                 };
                 let mut this = this.lock().unwrap();
                 if this.state != state {
@@ -276,8 +280,8 @@ impl Raft {
                             vote_count += 1;
                             if vote_count >= min_vote {
                                 this.transfer_state(state.term, Role::Leader, "win election");
+                                return;
                             }
-                            return;
                         }
                     }
                     Event::RpcError => {}
@@ -314,7 +318,7 @@ impl Raft {
                             leader_id,
                             prev_log_index: prev_log_index as u64,
                             prev_log_term: this.log[prev_log_index].term,
-                            entries: vec![],
+                            entries: this.log[next_index..].into(),
                             leader_commit: this.commit_index as u64,
                         };
                         debug!("{:?} ->{} {:?}", *this, i, args);
@@ -336,12 +340,42 @@ impl Raft {
                             return;
                         }
                         if reply.success {
+                            this.next_index[i] = match_index_if_success + 1;
                             this.match_index[i] = match_index_if_success;
+                            this.update_commit_from_match();
                         }
                     }
                     futures_timer::Delay::new(Self::generate_heartbeat_interval()).await;
                 }
             });
+        }
+    }
+
+    fn update_commit_from_match(&mut self) {
+        assert!(self.state.is_leader());
+        let mut match_index = self.match_index.clone();
+        match_index.sort();
+        let majority = self.peers.len() - (self.peers.len() + 1) / 2;
+        let commit_index = match_index[majority];
+        if self.log[commit_index].term != self.state.term {
+            return;
+        }
+        self.update_commit(commit_index);
+    }
+
+    fn update_commit(&mut self, commit_index: usize) {
+        for i in self.commit_index + 1..=commit_index {
+            self.apply_ch
+                .unbounded_send(ApplyMsg {
+                    command_valid: true,
+                    command: self.log[i].data.clone(),
+                    command_index: i as u64,
+                })
+                .unwrap();
+        }
+        if commit_index > self.commit_index {
+            self.commit_index = commit_index;
+            info!("{:?} commit to index {}", self, commit_index);
         }
     }
 
@@ -362,8 +396,11 @@ impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Raft({},t={:>2},{:?})",
-            self.me, self.state.term, self.state.role
+            "Raft({},t={},l={},{:?})",
+            self.me,
+            self.state.term,
+            self.log.len() - 1,
+            self.state.role
         )
     }
 }
@@ -409,7 +446,7 @@ impl Node {
     /// This method must return without blocking on the raft.
     pub fn start(&self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
         // Your code here.
-        let raft = self.raft.lock().unwrap();
+        let mut raft = self.raft.lock().unwrap();
         raft.start(command)
     }
 
@@ -533,7 +570,8 @@ impl RaftService for Node {
         }
         // If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
         if args.leader_commit as usize > this.commit_index {
-            this.commit_index = (args.leader_commit as usize).min(this.log.len() - 1);
+            let commit_index = (args.leader_commit as usize).min(this.log.len() - 1);
+            this.update_commit(commit_index);
         }
         debug!("{:?} <- accept {:?}", *this, args);
         Ok(AppendEntriesReply {
