@@ -174,7 +174,7 @@ impl Raft {
         let index = self.log.len() as u64;
         let term = self.state.term;
         self.log.push(Log { term, data });
-        info!("{:?} start", self);
+        info!("{:?} start index {}", self, index);
         Ok((index, term))
     }
 
@@ -305,6 +305,7 @@ impl Raft {
             let leader_id = self.me as u64;
             let peer = peer.clone();
             self.runtime.spawn_ok(async move {
+                let mut backoff = 1;
                 while let Some(this) = weak.upgrade() {
                     let (match_index_if_success, args) = {
                         let this = this.lock().unwrap();
@@ -343,6 +344,14 @@ impl Raft {
                             this.next_index[i] = match_index_if_success + 1;
                             this.match_index[i] = match_index_if_success;
                             this.update_commit_from_match();
+                        } else {
+                            if backoff >= this.next_index[i] {
+                                this.next_index[i] = 1;
+                            } else {
+                                this.next_index[i] -= backoff;
+                            }
+                            backoff *= 2;
+                            continue;
                         }
                     }
                     futures_timer::Delay::new(Self::generate_heartbeat_interval()).await;
@@ -355,7 +364,7 @@ impl Raft {
         assert!(self.state.is_leader());
         let mut match_index = self.match_index.clone();
         match_index.sort();
-        let majority = self.peers.len() - (self.peers.len() + 1) / 2;
+        let majority = self.peers.len() - self.peers.len() / 2;
         let commit_index = match_index[majority];
         if self.log[commit_index].term != self.state.term {
             return;
