@@ -4,6 +4,7 @@ use futures::{
 };
 use std::{
     fmt,
+    ops::{Index, RangeFrom},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
@@ -18,7 +19,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
-use crate::raft::{Log, Persist};
+use crate::raft::Log;
 
 /// As each Raft peer becomes aware that successive log entries are committed,
 /// the peer should send an `ApplyMsg` to the service (or tester) on the same
@@ -67,6 +68,85 @@ impl State {
     }
 }
 
+#[derive(Message)]
+struct Persist {
+    #[prost(uint64, tag = "1")]
+    term: u64,
+    #[prost(int64, tag = "2")]
+    voted_for: i64,
+    #[prost(message, tag = "3")]
+    log: Option<Logs>,
+}
+
+#[derive(Clone, Message)]
+struct Logs {
+    #[prost(uint64, tag = "1")]
+    offset: u64,
+    #[prost(message, repeated, tag = "2")]
+    logs: Vec<Log>,
+}
+
+impl Logs {
+    fn new() -> Self {
+        Logs {
+            offset: 0,
+            logs: vec![Log::default()],
+        }
+    }
+    fn len(&self) -> usize {
+        self.offset as usize + self.logs.len()
+    }
+    fn get(&self, index: usize) -> Option<&Log> {
+        index
+            .checked_sub(self.offset as usize)
+            .and_then(|i| self.logs.get(i))
+    }
+    fn push(&mut self, log: Log) {
+        self.logs.push(log);
+    }
+    fn extend_from_slice(&mut self, slice: &[Log]) {
+        self.logs.extend_from_slice(slice);
+    }
+    fn truncate(&mut self, len: usize) {
+        self.logs.truncate(len - self.offset as usize);
+    }
+    fn last(&self) -> Option<&Log> {
+        Some(self.logs.last().unwrap())
+    }
+    fn trim_start_until(&mut self, idx: usize) {
+        if let Some(delta) = idx.checked_sub(self.offset as usize) {
+            self.offset = idx as u64;
+            self.logs.drain(0..delta.min(self.logs.len()));
+        }
+    }
+    fn clear(&mut self) {
+        self.logs.clear();
+    }
+}
+
+impl Index<usize> for Logs {
+    type Output = Log;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect(&format!(
+            "index {} out of range {}..{}",
+            index,
+            self.offset,
+            self.len()
+        ))
+    }
+}
+
+impl Index<RangeFrom<usize>> for Logs {
+    type Output = [Log];
+    fn index(&self, range: RangeFrom<usize>) -> &Self::Output {
+        let start = range
+            .start
+            .checked_sub(self.offset as usize)
+            .expect("out of range");
+        &self.logs[start..]
+    }
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -86,7 +166,8 @@ pub struct Raft {
     state: State,
     // State Persistent state on all servers
     voted_for: Option<usize>,
-    log: Vec<Log>,
+    // NOTE: the first log is the last included one in the snapshot
+    log: Logs,
     // Volatile state on all servers
     commit_index: usize,
     last_applied: usize,
@@ -145,7 +226,7 @@ impl Raft {
             killed: false,
             state: State::default(),
             voted_for: None,
-            log: vec![Log::default()],
+            log: Logs::new(),
             commit_index: 0,
             last_applied: 0,
             next_index: vec![0; n],
@@ -167,8 +248,19 @@ impl Raft {
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
+    fn persist(&self) {
         // Your code here (2C).
+        let state = self.encode_persist_state();
+        self.persister.save_raft_state(state);
+    }
+
+    fn persist_with_snapshot(&self, snapshot: &[u8]) {
+        let state = self.encode_persist_state();
+        self.persister
+            .save_state_and_snapshot(state, snapshot.into());
+    }
+
+    fn encode_persist_state(&self) -> Vec<u8> {
         let mut data = vec![];
         let persist = Persist {
             term: self.state.term,
@@ -176,10 +268,10 @@ impl Raft {
                 Some(v) => v as i64,
                 None => -1,
             },
-            log: self.log.clone(),
+            log: Some(self.log.clone()),
         };
         labcodec::encode(&persist, &mut data).unwrap();
-        self.persister.save_raft_state(data);
+        data
     }
 
     /// restore previously persisted state.
@@ -195,7 +287,18 @@ impl Raft {
             -1 => None,
             v => Some(v as usize),
         };
-        self.log = persist.log;
+        self.log = persist.log.unwrap();
+        // apply snapshot
+        if self.log.offset != 0 {
+            self.apply_ch
+                .unbounded_send(ApplyMsg::Snapshot {
+                    data: self.persister.snapshot(),
+                    index: self.log.offset,
+                    term: self.log[self.log.offset as usize].term,
+                })
+                .unwrap();
+            self.last_applied = self.log.offset as usize;
+        }
     }
 
     fn start(&mut self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
@@ -340,47 +443,87 @@ impl Raft {
             self.runtime.spawn_ok(async move {
                 let mut backoff = 1;
                 loop {
-                    let (match_index_if_success, args) = {
+                    enum Task {
+                        AppendEntries(usize, AppendEntriesArgs),
+                        InstallSnapshot(InstallSnapshotArgs),
+                    }
+                    let task = {
                         let this = try_upgrade!(this);
                         let this = lock_and_check_raft!(this, state);
                         let next_index = this.next_index[i];
                         let prev_log_index = next_index - 1;
-                        let args = AppendEntriesArgs {
-                            term: state.term,
-                            leader_id,
-                            prev_log_index: prev_log_index as u64,
-                            prev_log_term: this.log[prev_log_index].term,
-                            entries: this.log[next_index..].into(),
-                            leader_commit: this.commit_index as u64,
-                        };
-                        debug!("{:?} ->{} {:?}", *this, i, args);
-                        (prev_log_index + args.entries.len(), args)
-                    };
-                    let reply = select! {
-                        ret = peer.append_entries(&args).fuse() => match ret {
-                            Err(_) => continue,
-                            Ok(x) => x,
-                        },
-                        _ = futures_timer::Delay::new(Self::generate_heartbeat_interval()).fuse() => continue,
-                    };
-                    {
-                        let this = try_upgrade!(this);
-                        let mut this = lock_and_check_raft!(this, state);
-                        if reply.term > this.state.term {
-                            this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
-                        }
-                        if reply.success {
-                            this.next_index[i] = match_index_if_success + 1;
-                            this.match_index[i] = match_index_if_success;
-                            this.update_commit_from_match();
+                        if prev_log_index < this.log.offset as usize {
+                            let args = InstallSnapshotArgs {
+                                term: state.term,
+                                leader_id,
+                                last_included_index: this.log.offset,
+                                last_included_term: this.log[this.log.offset as usize].term,
+                                data: this.persister.snapshot(),
+                            };
+                            debug!("{:?} ->{} {:?}", *this, i, args);
+                            Task::InstallSnapshot(args)
                         } else {
-                            if backoff >= this.next_index[i] {
-                                this.next_index[i] = 1;
-                            } else {
-                                this.next_index[i] -= backoff;
+                            let args = AppendEntriesArgs {
+                                term: state.term,
+                                leader_id,
+                                prev_log_index: prev_log_index as u64,
+                                prev_log_term: this.log[prev_log_index].term,
+                                entries: this.log[next_index..].into(),
+                                leader_commit: this.commit_index as u64,
+                            };
+                            debug!("{:?} ->{} {:?}", *this, i, args);
+                            Task::AppendEntries(prev_log_index + args.entries.len(), args)
+                        }
+                    };
+                    match task {
+                        Task::InstallSnapshot(args) => {
+                            let reply = select! {
+                                ret = peer.install_snapshot(&args).fuse() => match ret {
+                                    Err(_) => continue,
+                                    Ok(x) => x,
+                                },
+                                _ = futures_timer::Delay::new(Self::generate_heartbeat_interval()).fuse() => continue,
+                            };
+                            let this = try_upgrade!(this);
+                            let mut this = lock_and_check_raft!(this, state);
+                            // If RPC request or response contains term T > currentTerm: 
+                            // set currentTerm = T, convert to follower (§5.1)
+                            if reply.term > this.state.term {
+                                this.transfer_state(reply.term, Role::Follower, "higher term (->IS)");
                             }
-                            backoff *= 2;
-                            continue;
+                        }
+                        Task::AppendEntries(match_index_if_success, args) => {
+                            let reply = select! {
+                                ret = peer.append_entries(&args).fuse() => match ret {
+                                    Err(_) => continue,
+                                    Ok(x) => x,
+                                },
+                                _ = futures_timer::Delay::new(Self::generate_heartbeat_interval()).fuse() => continue,
+                            };
+                            let this = try_upgrade!(this);
+                            let mut this = lock_and_check_raft!(this, state);
+                            // If RPC request or response contains term T > currentTerm: 
+                            // set currentTerm = T, convert to follower (§5.1)
+                            if reply.term > this.state.term {
+                                this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
+                            }
+                            if reply.success {
+                                // If successful: update nextIndex and matchIndex for follower (§5.3)
+                                this.next_index[i] = match_index_if_success + 1;
+                                this.match_index[i] = match_index_if_success;
+                                this.update_commit_from_match();
+                                backoff = 1;
+                            } else {
+                                // If AppendEntries fails because of log inconsistency:
+                                // decrement nextIndex and retry (§5.3)
+                                if backoff >= this.next_index[i] {
+                                    this.next_index[i] = 1;
+                                } else {
+                                    this.next_index[i] -= backoff;
+                                }
+                                backoff *= 2;
+                                continue;
+                            }
                         }
                     }
                     futures_timer::Delay::new(Self::generate_heartbeat_interval()).await;
@@ -390,6 +533,8 @@ impl Raft {
     }
 
     fn update_commit_from_match(&mut self) {
+        // If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N,
+        // and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).
         assert!(self.state.is_leader());
         let mut match_index = self.match_index.clone();
         match_index.sort();
@@ -402,7 +547,13 @@ impl Raft {
     }
 
     fn update_commit(&mut self, commit_index: usize) {
-        for i in self.commit_index + 1..=commit_index {
+        if commit_index > self.commit_index {
+            self.commit_index = commit_index;
+            info!("{:?} commit to index {}", self, commit_index);
+        }
+        // If commitIndex > lastApplied: increment lastApplied,
+        // apply log[lastApplied] to state machine (§5.3)
+        for i in self.last_applied + 1..=commit_index {
             self.apply_ch
                 .unbounded_send(ApplyMsg::Command {
                     data: self.log[i].data.clone(),
@@ -410,10 +561,7 @@ impl Raft {
                 })
                 .unwrap();
         }
-        if commit_index > self.commit_index {
-            self.commit_index = commit_index;
-            info!("{:?} commit to index {}", self, commit_index);
-        }
+        self.last_applied = commit_index;
     }
 
     fn generate_election_timeout() -> Duration {
@@ -431,12 +579,14 @@ impl Raft {
         snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+        true
     }
 
     fn snapshot(&mut self, index: u64, snapshot: &[u8]) {
         // Your code here (2D).
-        crate::your_code_here((index, snapshot));
+        info!("{:?} snapshot at index {}", self, index);
+        self.log.trim_start_until(index as usize);
+        self.persist_with_snapshot(snapshot);
     }
 }
 
@@ -454,9 +604,10 @@ impl fmt::Debug for Raft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Raft({},t={},l={},{:?})",
+            "Raft({},t={},l=[{},{}],{:?})",
             self.me,
             self.state.term,
+            self.log.offset,
             self.log.len() - 1,
             self.state.role
         )
@@ -553,9 +704,8 @@ impl Node {
         snapshot: &[u8],
     ) -> bool {
         // Your code here.
-        // Example:
-        // self.raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
-        crate::your_code_here((last_included_term, last_included_index, snapshot));
+        let mut raft = self.raft.lock().unwrap();
+        raft.cond_install_snapshot(last_included_term, last_included_index, snapshot)
     }
 
     /// The service says it has created a snapshot that has all info up to and
@@ -564,9 +714,8 @@ impl Node {
     /// possible.
     pub fn snapshot(&self, index: u64, snapshot: &[u8]) {
         // Your code here.
-        // Example:
-        // self.raft.snapshot(index, snapshot)
-        crate::your_code_here((index, snapshot));
+        let mut raft = self.raft.lock().unwrap();
+        raft.snapshot(index, snapshot);
     }
 }
 
@@ -666,6 +815,58 @@ impl RaftService for Node {
         Ok(AppendEntriesReply {
             term: this.state.term,
             success: true,
+        })
+    }
+
+    async fn install_snapshot(
+        &self,
+        args: InstallSnapshotArgs,
+    ) -> labrpc::Result<InstallSnapshotReply> {
+        let mut this = self.raft.lock().unwrap();
+        debug!("{:?} <- {:?}", *this, args);
+        // 1. Reply immediately if term < currentTerm
+        if args.term < this.state.term {
+            return Ok(InstallSnapshotReply {
+                term: this.state.term,
+            });
+        }
+        // 0. If RPC request or response contains term T > currentTerm:
+        // set currentTerm = T, convert to follower (§5.1)
+        if args.term > this.state.term {
+            this.transfer_state(args.term, Role::Follower, "higher term (<-IS)");
+        }
+        // 2. Create new snapshot file if first chunk (offset is 0)
+        // 3. Write data into snapshot file at given offset
+        this.persist_with_snapshot(&args.data);
+        // 4. Reply and wait for more data chunks if done is false
+        // 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
+        // 6. If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it and reply
+        let prev_index = args.last_included_index as usize;
+        if matches!(this.log.get(prev_index), Some(log) if log.term == args.last_included_term) {
+            this.log.trim_start_until(prev_index);
+            return Ok(InstallSnapshotReply {
+                term: this.state.term,
+            });
+        }
+        // 7. Discard the entire log
+        this.log.clear();
+        this.log.trim_start_until(prev_index);
+        this.log.push(Log {
+            term: args.last_included_term,
+            data: vec![],
+        });
+        // 8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
+        this.apply_ch
+            .unbounded_send(ApplyMsg::Snapshot {
+                data: args.data.clone(),
+                index: args.last_included_index,
+                term: args.last_included_term,
+            })
+            .unwrap();
+        this.last_applied = prev_index;
+
+        Ok(InstallSnapshotReply {
+            term: this.state.term,
         })
     }
 }
