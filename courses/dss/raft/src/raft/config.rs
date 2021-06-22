@@ -136,6 +136,14 @@ impl Config {
         cfg
     }
 
+    pub fn get_raft(&self, i: usize) -> raft::Node {
+        self.get_raft_option(i).unwrap()
+    }
+
+    pub fn get_raft_option(&self, i: usize) -> Option<raft::Node> {
+        self.rafts.lock().unwrap()[i].clone()
+    }
+
     pub fn rpc_count(&self, server: usize) -> usize {
         self.net.count(&format!("{}", server))
     }
