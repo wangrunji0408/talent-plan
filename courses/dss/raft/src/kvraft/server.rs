@@ -30,7 +30,7 @@ impl KvServer {
     pub fn new(
         servers: Vec<crate::proto::raftpb::RaftClient>,
         me: usize,
-        persister: Box<dyn raft::persister::Persister>,
+        persister: Arc<dyn raft::persister::Persister>,
         max_raft_state: Option<usize>,
     ) -> KvServer {
         // You may need initialization code here.

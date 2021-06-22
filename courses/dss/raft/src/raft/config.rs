@@ -402,7 +402,7 @@ impl Config {
         }
 
         let (tx, apply_ch) = unbounded();
-        let rf = raft::Raft::new(clients, i, Box::new(self.saved[i].clone()), tx);
+        let rf = raft::Raft::new(clients, i, self.saved[i].clone(), tx);
         let node = raft::Node::new(rf);
         self.rafts.lock().unwrap()[i] = Some(node.clone());
 

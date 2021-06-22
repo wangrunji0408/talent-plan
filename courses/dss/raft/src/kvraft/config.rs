@@ -284,7 +284,7 @@ impl Config {
         let p = Arc::new(sp);
         servers.saved[i] = p.clone();
 
-        let kv = server::KvServer::new(ends, i, Box::new(p), self.maxraftstate);
+        let kv = server::KvServer::new(ends, i, p, self.maxraftstate);
         let rf_node = kv.rf.clone();
         let kv_node = server::Node::new(kv);
         servers.kvservers[i] = Some(kv_node.clone());
