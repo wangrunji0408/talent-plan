@@ -53,7 +53,7 @@ pub struct Raft {
     // RPC end points of all peers
     peers: Vec<RaftClient>,
     // Object to hold this peer's persisted state
-    persister: Box<dyn Persister>,
+    persister: Arc<dyn Persister>,
     // this peer's index into peers[]
     me: usize,
     state: Arc<State>,
@@ -74,7 +74,7 @@ impl Raft {
     pub fn new(
         peers: Vec<RaftClient>,
         me: usize,
-        persister: Box<dyn Persister>,
+        persister: Arc<dyn Persister>,
         apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();

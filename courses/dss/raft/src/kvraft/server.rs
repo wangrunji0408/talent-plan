@@ -1,4 +1,5 @@
 use futures::channel::mpsc::unbounded;
+use std::sync::Arc;
 
 use crate::proto::kvraftpb::*;
 use crate::raft;
@@ -15,7 +16,7 @@ impl KvServer {
     pub fn new(
         servers: Vec<crate::proto::raftpb::RaftClient>,
         me: usize,
-        persister: Box<dyn raft::persister::Persister>,
+        persister: Arc<dyn raft::persister::Persister>,
         maxraftstate: Option<usize>,
     ) -> KvServer {
         // You may need initialization code here.
