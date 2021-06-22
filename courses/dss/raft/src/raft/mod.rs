@@ -444,10 +444,10 @@ impl Raft {
                 let mut backoff = 1;
                 loop {
                     enum Task {
-                        AppendEntries(usize, AppendEntriesArgs),
+                        AppendEntries(AppendEntriesArgs),
                         InstallSnapshot(InstallSnapshotArgs),
                     }
-                    let task = {
+                    let (match_index_if_success, task) = {
                         let this = try_upgrade!(this);
                         let this = lock_and_check_raft!(this, state);
                         let next_index = this.next_index[i];
@@ -461,7 +461,7 @@ impl Raft {
                                 data: this.persister.snapshot(),
                             };
                             debug!("{:?} ->{} {:?}", *this, i, args);
-                            Task::InstallSnapshot(args)
+                            (this.log.offset as usize, Task::InstallSnapshot(args))
                         } else {
                             let args = AppendEntriesArgs {
                                 term: state.term,
@@ -472,7 +472,7 @@ impl Raft {
                                 leader_commit: this.commit_index as u64,
                             };
                             debug!("{:?} ->{} {:?}", *this, i, args);
-                            Task::AppendEntries(prev_log_index + args.entries.len(), args)
+                            (prev_log_index + args.entries.len(), Task::AppendEntries(args))
                         }
                     };
                     match task {
@@ -490,9 +490,15 @@ impl Raft {
                             // set currentTerm = T, convert to follower (§5.1)
                             if reply.term > this.state.term {
                                 this.transfer_state(reply.term, Role::Follower, "higher term (->IS)");
+                                return;
                             }
+                            this.next_index[i] = match_index_if_success + 1;
+                            this.match_index[i] = match_index_if_success;
+                            this.update_commit_from_match();
+                            backoff = 1;
+                            continue;
                         }
-                        Task::AppendEntries(match_index_if_success, args) => {
+                        Task::AppendEntries(args) => {
                             let reply = select! {
                                 ret = peer.append_entries(&args).fuse() => match ret {
                                     Err(_) => continue,
@@ -506,6 +512,7 @@ impl Raft {
                             // set currentTerm = T, convert to follower (§5.1)
                             if reply.term > this.state.term {
                                 this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
+                                return;
                             }
                             if reply.success {
                                 // If successful: update nextIndex and matchIndex for follower (§5.3)
@@ -830,6 +837,7 @@ impl RaftService for Node {
                 term: this.state.term,
             });
         }
+        this.last_apply_entries_received = Instant::now();
         // 0. If RPC request or response contains term T > currentTerm:
         // set currentTerm = T, convert to follower (§5.1)
         if args.term > this.state.term {
