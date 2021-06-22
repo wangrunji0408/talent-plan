@@ -581,9 +581,9 @@ impl Raft {
 
     fn cond_install_snapshot(
         &mut self,
-        last_included_term: u64,
-        last_included_index: u64,
-        snapshot: &[u8],
+        _last_included_term: u64,
+        _last_included_index: u64,
+        _snapshot: &[u8],
     ) -> bool {
         // Your code here (2D).
         true

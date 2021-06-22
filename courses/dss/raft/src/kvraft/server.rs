@@ -1,14 +1,27 @@
-use futures::channel::mpsc::unbounded;
+use futures::{
+    channel::{mpsc, oneshot},
+    executor::ThreadPool,
+    stream::StreamExt,
+};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use crate::proto::kvraftpb::*;
 use crate::raft;
 
+#[allow(dead_code)]
 pub struct KvServer {
     pub rf: raft::Node,
     me: usize,
     // snapshot if log grows this big
-    maxraftstate: Option<usize>,
+    max_raft_state: Option<usize>,
     // Your definitions here.
+    runtime: ThreadPool,
+    // { index -> (msg, sender) }
+    pending_rpcs: Arc<Mutex<HashMap<u64, (RaftCmd, oneshot::Sender<String>)>>>,
 }
 
 impl KvServer {
@@ -16,23 +29,74 @@ impl KvServer {
         servers: Vec<crate::proto::raftpb::RaftClient>,
         me: usize,
         persister: Box<dyn raft::persister::Persister>,
-        maxraftstate: Option<usize>,
+        max_raft_state: Option<usize>,
     ) -> KvServer {
         // You may need initialization code here.
 
-        let (tx, apply_ch) = unbounded();
+        let (tx, mut apply_ch) = mpsc::unbounded();
         let rf = raft::Raft::new(servers, me, persister, tx);
+        let rf = raft::Node::new(rf);
 
-        crate::your_code_here((rf, maxraftstate, apply_ch))
+        let pending_rpcs = Arc::new(Mutex::new(
+            HashMap::<u64, (RaftCmd, oneshot::Sender<String>)>::new(),
+        ));
+        let pending_rpcs0 = pending_rpcs.clone();
+        let runtime = ThreadPool::new().unwrap();
+        runtime.spawn_ok(async move {
+            let mut kv = HashMap::new();
+            while let Some(msg) = apply_ch.next().await {
+                match msg {
+                    raft::ApplyMsg::Snapshot { .. } => todo!(),
+                    raft::ApplyMsg::Command { index, data } => {
+                        let cmd = labcodec::decode::<RaftCmd>(&data).unwrap();
+                        let cmd1 = cmd.clone();
+                        let ret = match Op::from_i32(cmd.op).unwrap() {
+                            Op::Put => {
+                                kv.insert(cmd.key, cmd.value);
+                                "".into()
+                            }
+                            Op::Append => {
+                                kv.entry(cmd.key).or_default().push_str(&cmd.value);
+                                "".into()
+                            }
+                            Op::Get => kv.get(&cmd.key).cloned().unwrap_or_default(),
+                            Op::Unknown => unreachable!(),
+                        };
+                        let mut pending_rpcs = pending_rpcs0.lock().unwrap();
+                        if let Some((cmd0, sender)) = pending_rpcs.remove(&index) {
+                            if cmd1 == cmd0 {
+                                // message match, success
+                                sender.send(ret).unwrap();
+                            }
+                            // otherwise drop the sender
+                        }
+                    }
+                }
+            }
+        });
+
+        KvServer {
+            rf,
+            me,
+            max_raft_state,
+            runtime,
+            pending_rpcs,
+        }
+    }
+
+    fn register_rpc(&self, index: u64, cmd: RaftCmd) -> oneshot::Receiver<String> {
+        let (sender, recver) = oneshot::channel();
+        self.pending_rpcs
+            .lock()
+            .unwrap()
+            .insert(index, (cmd, sender));
+        recver
     }
 }
 
-impl KvServer {
-    /// Only for suppressing deadcode warnings.
-    #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = &self.me;
-        let _ = &self.maxraftstate;
+impl fmt::Debug for KvServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KvServer({})", self.me,)
     }
 }
 
@@ -53,12 +117,15 @@ impl KvServer {
 #[derive(Clone)]
 pub struct Node {
     // Your definitions here.
+    server: Arc<KvServer>,
 }
 
 impl Node {
     pub fn new(kv: KvServer) -> Node {
         // Your code here.
-        crate::your_code_here(kv);
+        Node {
+            server: Arc::new(kv),
+        }
     }
 
     /// the tester calls kill() when a KVServer instance won't
@@ -72,6 +139,7 @@ impl Node {
         // self.server.kill();
 
         // Your code here, if desired.
+        self.server.rf.kill();
     }
 
     /// The current term of this peer.
@@ -86,7 +154,7 @@ impl Node {
 
     pub fn get_state(&self) -> raft::State {
         // Your code here.
-        raft::State::default()
+        self.server.rf.get_state()
     }
 }
 
@@ -95,12 +163,87 @@ impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn get(&self, arg: GetRequest) -> labrpc::Result<GetReply> {
         // Your code here.
-        crate::your_code_here(arg)
+        let cmd = RaftCmd {
+            key: arg.key.clone(),
+            value: "".into(),
+            op: Op::Get as _,
+        };
+        let index = match self.server.rf.start(&cmd) {
+            Ok((index, _)) => index,
+            Err(raft::errors::Error::NotLeader) => {
+                return Ok(GetReply {
+                    wrong_leader: true,
+                    err: "".into(),
+                    value: "".into(),
+                })
+            }
+            e => panic!("{:?}", e),
+        };
+        let recver = self.server.register_rpc(index, cmd);
+        debug!("{:?} start {:?}", self.server, arg);
+        // TODO: timeout?
+        match recver.await {
+            Err(_) => {
+                debug!("{:?} fail  {:?}", self.server, arg);
+                Ok(GetReply {
+                    wrong_leader: false,
+                    err: "failed to commit".into(),
+                    value: "".into(),
+                })
+            }
+            Ok(value) => {
+                debug!("{:?} ok    {:?}", self.server, arg);
+                Ok(GetReply {
+                    wrong_leader: false,
+                    err: "".into(),
+                    value,
+                })
+            }
+        }
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn put_append(&self, arg: PutAppendRequest) -> labrpc::Result<PutAppendReply> {
         // Your code here.
-        crate::your_code_here(arg)
+        let cmd = RaftCmd {
+            key: arg.key.clone(),
+            value: arg.value.clone(),
+            op: arg.op.clone(),
+        };
+        let index = match self.server.rf.start(&cmd) {
+            Ok((index, _)) => index,
+            Err(raft::errors::Error::NotLeader) => {
+                return Ok(PutAppendReply {
+                    wrong_leader: true,
+                    err: "".into(),
+                })
+            }
+            e => panic!("{:?}", e),
+        };
+        let recver = self.server.register_rpc(index, cmd);
+        debug!("{:?} start {:?}", self.server, arg);
+        match recver.await {
+            Err(_) => {
+                debug!("{:?} fail  {:?}", self.server, arg);
+                Ok(PutAppendReply {
+                    wrong_leader: false,
+                    err: "failed to commit".into(),
+                })
+            }
+            Ok(_) => {
+                debug!("{:?} ok    {:?}", self.server, arg);
+                Ok(PutAppendReply {
+                    wrong_leader: false,
+                    err: "".into(),
+                })
+            }
+        }
     }
 }
+
+// async fn timeout<F: Future>(f: F) -> Option<F::Output> {
+//     select! {
+//         ret = f.fuse() => Some(ret)
+//         _ = futures_timer::Delay::new(Duration::from_millis(10)).fuse() => None,
+//     }
+// }

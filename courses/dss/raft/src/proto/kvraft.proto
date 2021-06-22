@@ -6,6 +6,7 @@ enum Op {
     Unknown = 0;
     Put = 1;
     Append = 2;
+    Get = 3;
 }
 
 /// Put or Append
@@ -31,4 +32,10 @@ message GetReply {
     bool wrong_leader = 1;
     string err = 2;
     string value = 3;
+}
+
+message RaftCmd {
+    string key = 1;
+    string value = 2;
+    Op op = 3;
 }
