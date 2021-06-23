@@ -57,6 +57,10 @@ impl Clerk {
                     }
                     continue;
                 }
+                Ok(GetReply { err, .. }) if err != "" => {
+                    debug!("{:?} <-{} {:?}", self, i, err);
+                    continue;
+                }
                 Ok(GetReply { value, .. }) => {
                     debug!("{:?} <-{} Get({:?})", self, i, key);
                     self.leader.store(i, Ordering::Relaxed);
@@ -64,7 +68,7 @@ impl Clerk {
                 }
             }
         }
-        todo!("retry")
+        unreachable!()
     }
 
     /// shared by Put and Append.
@@ -78,11 +82,13 @@ impl Clerk {
                 key,
                 value,
                 op: Op::Append as _,
+                id: rand::random(),
             },
             ClientOp::Put(key, value) => PutAppendRequest {
                 key,
                 value,
                 op: Op::Put as _,
+                id: rand::random(),
             },
         };
         for i in self.leader.load(Ordering::Relaxed).. {
@@ -94,6 +100,10 @@ impl Clerk {
                     if i == self.servers.len() - 1 {
                         thread::sleep(Duration::from_millis(100));
                     }
+                    continue;
+                }
+                Ok(PutAppendReply { err, .. }) if err != "" => {
+                    debug!("{:?} <-{} {:?}", self, i, err);
                     continue;
                 }
                 Ok(PutAppendReply { .. }) => {

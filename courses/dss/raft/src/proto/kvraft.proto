@@ -16,6 +16,7 @@ message PutAppendRequest {
     // "Put" or "Append"
     Op op = 3;
     // You'll have to add definitions here.
+    uint64 id = 4;
 }
 
 message PutAppendReply {
@@ -38,4 +39,5 @@ message RaftCmd {
     string key = 1;
     string value = 2;
     Op op = 3;
+    uint64 id = 4;
 }

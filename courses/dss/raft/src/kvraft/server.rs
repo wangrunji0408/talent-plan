@@ -1,12 +1,14 @@
 use futures::{
     channel::{mpsc, oneshot},
     executor::ThreadPool,
-    stream::StreamExt,
+    select, FutureExt, StreamExt,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::proto::kvraftpb::*;
@@ -20,8 +22,8 @@ pub struct KvServer {
     max_raft_state: Option<usize>,
     // Your definitions here.
     runtime: ThreadPool,
-    // { index -> (msg, sender) }
-    pending_rpcs: Arc<Mutex<HashMap<u64, (RaftCmd, oneshot::Sender<String>)>>>,
+    // { index -> (id, sender) }
+    pending_rpcs: Arc<Mutex<HashMap<u64, (u64, oneshot::Sender<String>)>>>,
 }
 
 impl KvServer {
@@ -38,35 +40,41 @@ impl KvServer {
         let rf = raft::Node::new(rf);
 
         let pending_rpcs = Arc::new(Mutex::new(
-            HashMap::<u64, (RaftCmd, oneshot::Sender<String>)>::new(),
+            HashMap::<u64, (u64, oneshot::Sender<String>)>::new(),
         ));
         let pending_rpcs0 = pending_rpcs.clone();
         let runtime = ThreadPool::new().unwrap();
         runtime.spawn_ok(async move {
+            let mut ids = HashSet::new();
             let mut kv = HashMap::new();
             while let Some(msg) = apply_ch.next().await {
                 match msg {
                     raft::ApplyMsg::Snapshot { .. } => todo!(),
                     raft::ApplyMsg::Command { index, data } => {
                         let cmd = labcodec::decode::<RaftCmd>(&data).unwrap();
-                        let cmd1 = cmd.clone();
                         let ret = match Op::from_i32(cmd.op).unwrap() {
                             Op::Put => {
-                                kv.insert(cmd.key, cmd.value);
+                                // prevent duplicate put
+                                if ids.insert(cmd.id) {
+                                    kv.insert(cmd.key, cmd.value);
+                                }
                                 "".into()
                             }
                             Op::Append => {
-                                kv.entry(cmd.key).or_default().push_str(&cmd.value);
+                                // prevent duplicate append
+                                if ids.insert(cmd.id) {
+                                    kv.entry(cmd.key).or_default().push_str(&cmd.value);
+                                }
                                 "".into()
                             }
                             Op::Get => kv.get(&cmd.key).cloned().unwrap_or_default(),
                             Op::Unknown => unreachable!(),
                         };
                         let mut pending_rpcs = pending_rpcs0.lock().unwrap();
-                        if let Some((cmd0, sender)) = pending_rpcs.remove(&index) {
-                            if cmd1 == cmd0 {
+                        if let Some((id, sender)) = pending_rpcs.remove(&index) {
+                            if cmd.id == id {
                                 // message match, success
-                                sender.send(ret).unwrap();
+                                let _ = sender.send(ret);
                             }
                             // otherwise drop the sender
                         }
@@ -84,12 +92,12 @@ impl KvServer {
         }
     }
 
-    fn register_rpc(&self, index: u64, cmd: RaftCmd) -> oneshot::Receiver<String> {
+    fn register_rpc(&self, index: u64, id: u64) -> oneshot::Receiver<String> {
         let (sender, recver) = oneshot::channel();
         self.pending_rpcs
             .lock()
             .unwrap()
-            .insert(index, (cmd, sender));
+            .insert(index, (id, sender));
         recver
     }
 }
@@ -167,6 +175,7 @@ impl KvService for Node {
             key: arg.key.clone(),
             value: "".into(),
             op: Op::Get as _,
+            id: rand::random(),
         };
         let index = match self.server.rf.start(&cmd) {
             Ok((index, _)) => index,
@@ -179,19 +188,26 @@ impl KvService for Node {
             }
             e => panic!("{:?}", e),
         };
-        let recver = self.server.register_rpc(index, cmd);
+        let recver = self.server.register_rpc(index, cmd.id);
         debug!("{:?} start {:?}", self.server, arg);
-        // TODO: timeout?
-        match recver.await {
-            Err(_) => {
-                debug!("{:?} fail  {:?}", self.server, arg);
+        match timeout(recver).await {
+            None => {
+                debug!("{:?} Tout  {:?}", self.server, arg);
                 Ok(GetReply {
                     wrong_leader: false,
-                    err: "failed to commit".into(),
+                    err: "commit timeout".into(),
                     value: "".into(),
                 })
             }
-            Ok(value) => {
+            Some(Err(_)) => {
+                debug!("{:?} fail  {:?}", self.server, arg);
+                Ok(GetReply {
+                    wrong_leader: false,
+                    err: "commit failed".into(),
+                    value: "".into(),
+                })
+            }
+            Some(Ok(value)) => {
                 debug!("{:?} ok    {:?}", self.server, arg);
                 Ok(GetReply {
                     wrong_leader: false,
@@ -209,6 +225,7 @@ impl KvService for Node {
             key: arg.key.clone(),
             value: arg.value.clone(),
             op: arg.op.clone(),
+            id: arg.id,
         };
         let index = match self.server.rf.start(&cmd) {
             Ok((index, _)) => index,
@@ -220,17 +237,24 @@ impl KvService for Node {
             }
             e => panic!("{:?}", e),
         };
-        let recver = self.server.register_rpc(index, cmd);
+        let recver = self.server.register_rpc(index, cmd.id);
         debug!("{:?} start {:?}", self.server, arg);
-        match recver.await {
-            Err(_) => {
+        match timeout(recver).await {
+            None => {
+                debug!("{:?} Tout  {:?}", self.server, arg);
+                Ok(PutAppendReply {
+                    wrong_leader: false,
+                    err: "commit timeout".into(),
+                })
+            }
+            Some(Err(_)) => {
                 debug!("{:?} fail  {:?}", self.server, arg);
                 Ok(PutAppendReply {
                     wrong_leader: false,
-                    err: "failed to commit".into(),
+                    err: "commit failed".into(),
                 })
             }
-            Ok(_) => {
+            Some(Ok(_)) => {
                 debug!("{:?} ok    {:?}", self.server, arg);
                 Ok(PutAppendReply {
                     wrong_leader: false,
@@ -241,9 +265,9 @@ impl KvService for Node {
     }
 }
 
-// async fn timeout<F: Future>(f: F) -> Option<F::Output> {
-//     select! {
-//         ret = f.fuse() => Some(ret)
-//         _ = futures_timer::Delay::new(Duration::from_millis(10)).fuse() => None,
-//     }
-// }
+async fn timeout<F: Future>(f: F) -> Option<F::Output> {
+    select! {
+        ret = f.fuse() => Some(ret),
+        _ = futures_timer::Delay::new(Duration::from_millis(500)).fuse() => None,
+    }
+}
