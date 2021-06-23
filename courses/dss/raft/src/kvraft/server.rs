@@ -4,7 +4,7 @@ use futures::{
     select, FutureExt, StreamExt,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     future::Future,
     sync::{Arc, Mutex},
@@ -14,13 +14,11 @@ use std::{
 use crate::proto::kvraftpb::*;
 use crate::raft;
 
-#[allow(dead_code)]
 pub struct KvServer {
     pub rf: raft::Node,
     me: usize,
-    // snapshot if log grows this big
-    max_raft_state: Option<usize>,
     // Your definitions here.
+    #[allow(dead_code)]
     runtime: ThreadPool,
     // { index -> (id, sender) }
     pending_rpcs: Arc<Mutex<HashMap<u64, (u64, oneshot::Sender<String>)>>>,
@@ -36,48 +34,45 @@ impl KvServer {
         // You may need initialization code here.
 
         let (tx, mut apply_ch) = mpsc::unbounded();
-        let rf = raft::Raft::new(servers, me, persister, tx);
+        let rf = raft::Raft::new(servers, me, persister.clone(), tx);
         let rf = raft::Node::new(rf);
 
         let pending_rpcs = Arc::new(Mutex::new(
             HashMap::<u64, (u64, oneshot::Sender<String>)>::new(),
         ));
         let pending_rpcs0 = pending_rpcs.clone();
+        let rf0 = rf.clone();
         let runtime = ThreadPool::new().unwrap();
         runtime.spawn_ok(async move {
-            let mut ids = HashSet::new();
-            let mut kv = HashMap::new();
+            let mut state = State::default();
+            let mut state_index;
             while let Some(msg) = apply_ch.next().await {
                 match msg {
-                    raft::ApplyMsg::Snapshot { .. } => todo!(),
+                    raft::ApplyMsg::Snapshot { index, data, .. } => {
+                        state = State::from_snapshot(&data);
+                        state_index = index;
+                    }
                     raft::ApplyMsg::Command { index, data } => {
                         let cmd = labcodec::decode::<RaftCmd>(&data).unwrap();
-                        let ret = match Op::from_i32(cmd.op).unwrap() {
-                            Op::Put => {
-                                // prevent duplicate put
-                                if ids.insert(cmd.id) {
-                                    kv.insert(cmd.key, cmd.value);
-                                }
-                                "".into()
-                            }
-                            Op::Append => {
-                                // prevent duplicate append
-                                if ids.insert(cmd.id) {
-                                    kv.entry(cmd.key).or_default().push_str(&cmd.value);
-                                }
-                                "".into()
-                            }
-                            Op::Get => kv.get(&cmd.key).cloned().unwrap_or_default(),
-                            Op::Unknown => unreachable!(),
-                        };
+                        let cmd_id = cmd.id;
+                        let ret = state.apply(cmd);
+                        state_index = index;
+
+                        // send result to RPC
                         let mut pending_rpcs = pending_rpcs0.lock().unwrap();
                         if let Some((id, sender)) = pending_rpcs.remove(&index) {
-                            if cmd.id == id {
+                            if cmd_id == id {
                                 // message match, success
                                 let _ = sender.send(ret);
                             }
                             // otherwise drop the sender
                         }
+                    }
+                }
+                // snapshot if needed
+                if let Some(size) = max_raft_state {
+                    if state_index % 10 == 0 && persister.raft_state().len() >= size {
+                        rf0.snapshot(state_index, &state.snapshot());
                     }
                 }
             }
@@ -86,7 +81,6 @@ impl KvServer {
         KvServer {
             rf,
             me,
-            max_raft_state,
             runtime,
             pending_rpcs,
         }
@@ -105,6 +99,70 @@ impl KvServer {
 impl fmt::Debug for KvServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "KvServer({})", self.me,)
+    }
+}
+
+#[derive(Debug, Default)]
+struct State {
+    kv: HashMap<String, String>,
+    // A circular queue with max capacity 50
+    ids: Vec<u64>,
+}
+
+impl State {
+    fn snapshot(&self) -> Vec<u8> {
+        let mut keys = vec![];
+        let mut values = vec![];
+        keys.reserve(self.kv.len());
+        values.reserve(self.kv.len());
+        for (k, v) in self.kv.iter() {
+            keys.push(k.clone());
+            values.push(v.clone());
+        }
+        let snapshot = RaftSnapshot {
+            keys,
+            values,
+            ids: self.ids.clone(),
+        };
+        let mut data = vec![];
+        labcodec::encode(&snapshot, &mut data).unwrap();
+        data
+    }
+
+    fn from_snapshot(data: &[u8]) -> Self {
+        let s = labcodec::decode::<RaftSnapshot>(data).unwrap();
+        let keys = s.keys.iter().cloned();
+        let values = s.values.iter().cloned();
+        State {
+            kv: keys.zip(values).collect(),
+            ids: s.ids,
+        }
+    }
+
+    fn apply(&mut self, cmd: RaftCmd) -> String {
+        let unique = !self.ids.contains(&cmd.id);
+        if self.ids.len() > 50 {
+            self.ids.remove(0);
+        }
+        self.ids.push(cmd.id);
+        match Op::from_i32(cmd.op).unwrap() {
+            Op::Put => {
+                // prevent duplicate put
+                if unique {
+                    self.kv.insert(cmd.key, cmd.value);
+                }
+                "".into()
+            }
+            Op::Append => {
+                // prevent duplicate append
+                if unique {
+                    self.kv.entry(cmd.key).or_default().push_str(&cmd.value);
+                }
+                "".into()
+            }
+            Op::Get => self.kv.get(&cmd.key).cloned().unwrap_or_default(),
+            Op::Unknown => unreachable!(),
+        }
     }
 }
 

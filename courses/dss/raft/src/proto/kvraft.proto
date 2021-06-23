@@ -41,3 +41,9 @@ message RaftCmd {
     Op op = 3;
     uint64 id = 4;
 }
+
+message RaftSnapshot {
+    repeated string keys = 1;
+    repeated string values = 2;
+    repeated uint64 ids = 3;
+}

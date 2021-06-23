@@ -93,6 +93,9 @@ impl Logs {
             logs: vec![Log::default()],
         }
     }
+    fn begin(&self) -> usize {
+        self.offset as usize
+    }
     fn len(&self) -> usize {
         self.offset as usize + self.logs.len()
     }
@@ -288,17 +291,7 @@ impl Raft {
             v => Some(v as usize),
         };
         self.log = persist.log.unwrap();
-        // apply snapshot
-        if self.log.offset != 0 {
-            self.apply_ch
-                .unbounded_send(ApplyMsg::Snapshot {
-                    data: self.persister.snapshot(),
-                    index: self.log.offset,
-                    term: self.log[self.log.offset as usize].term,
-                })
-                .unwrap();
-            self.last_applied = self.log.offset as usize;
-        }
+        self.update_commit(self.log.begin());
     }
 
     fn start(&mut self, command: &impl labcodec::Message) -> Result<(u64, u64)> {
@@ -547,28 +540,45 @@ impl Raft {
         match_index.sort();
         let majority = self.peers.len() - self.peers.len() / 2;
         let commit_index = match_index[majority];
-        if self.log[commit_index].term != self.state.term {
+        if commit_index <= self.commit_index || self.log[commit_index].term != self.state.term {
             return;
         }
         self.update_commit(commit_index);
     }
 
     fn update_commit(&mut self, commit_index: usize) {
-        if commit_index > self.commit_index {
-            self.commit_index = commit_index;
-            info!("{:?} commit to index {}", self, commit_index);
+        if commit_index <= self.commit_index {
+            return;
         }
+        self.commit_index = commit_index;
+        info!("{:?} commit to index {}", self, commit_index);
+        self.apply();
+    }
+
+    fn apply(&mut self) {
         // If commitIndex > lastApplied: increment lastApplied,
         // apply log[lastApplied] to state machine (§5.3)
-        for i in self.last_applied + 1..=commit_index {
-            self.apply_ch
-                .unbounded_send(ApplyMsg::Command {
-                    data: self.log[i].data.clone(),
-                    index: i as u64,
-                })
-                .unwrap();
+        while self.commit_index > self.last_applied {
+            let mut i = self.last_applied + 1;
+            if i <= self.log.begin() {
+                i = self.log.begin();
+                self.apply_ch
+                    .unbounded_send(ApplyMsg::Snapshot {
+                        data: self.persister.snapshot(),
+                        index: i as u64,
+                        term: self.log[i].term,
+                    })
+                    .unwrap();
+            } else {
+                self.apply_ch
+                    .unbounded_send(ApplyMsg::Command {
+                        data: self.log[i].data.clone(),
+                        index: i as u64,
+                    })
+                    .unwrap();
+            }
+            self.last_applied = i;
         }
-        self.last_applied = commit_index;
     }
 
     fn generate_election_timeout() -> Duration {
@@ -614,7 +624,7 @@ impl fmt::Debug for Raft {
             "Raft({},t={},l=[{},{}],{:?})",
             self.me,
             self.state.term,
-            self.log.offset,
+            self.log.begin(),
             self.log.len() - 1,
             self.state.role
         )
@@ -845,33 +855,24 @@ impl RaftService for Node {
         }
         // 2. Create new snapshot file if first chunk (offset is 0)
         // 3. Write data into snapshot file at given offset
-        this.persist_with_snapshot(&args.data);
         // 4. Reply and wait for more data chunks if done is false
         // 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
         // 6. If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it and reply
         let prev_index = args.last_included_index as usize;
         if matches!(this.log.get(prev_index), Some(log) if log.term == args.last_included_term) {
             this.log.trim_start_until(prev_index);
-            return Ok(InstallSnapshotReply {
-                term: this.state.term,
+        } else {
+            // 7. Discard the entire log
+            this.log.clear();
+            this.log.trim_start_until(prev_index);
+            this.log.push(Log {
+                term: args.last_included_term,
+                data: vec![],
             });
         }
-        // 7. Discard the entire log
-        this.log.clear();
-        this.log.trim_start_until(prev_index);
-        this.log.push(Log {
-            term: args.last_included_term,
-            data: vec![],
-        });
+        this.persist_with_snapshot(&args.data);
         // 8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-        this.apply_ch
-            .unbounded_send(ApplyMsg::Snapshot {
-                data: args.data.clone(),
-                index: args.last_included_index,
-                term: args.last_included_term,
-            })
-            .unwrap();
-        this.last_applied = prev_index;
+        this.update_commit(prev_index);
 
         Ok(InstallSnapshotReply {
             term: this.state.term,
