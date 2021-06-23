@@ -1,6 +1,7 @@
-use futures::executor::block_on;
+use futures::{executor::block_on, select, FutureExt};
 use std::{
     fmt,
+    future::Future,
     sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::Duration,
@@ -48,8 +49,12 @@ impl Clerk {
         let arg = GetRequest { key: key.clone() };
         for i in self.leader.load(Ordering::Relaxed).. {
             let i = i % self.servers.len();
-            match block_on(self.servers[i].get(&arg)) {
-                Err(e) => panic!("{:?}", e),
+            debug!("{:?} ->{} {:?}", self, i, arg);
+            match block_on(timeout(self.servers[i].get(&arg))) {
+                Err(e) => {
+                    debug!("{:?} <-{} {:?}", self, i, e);
+                    continue;
+                }
                 Ok(GetReply { wrong_leader, .. }) if wrong_leader => {
                     debug!("{:?} <-{} wrong leader", self, i);
                     if i == self.servers.len() - 1 {
@@ -93,8 +98,12 @@ impl Clerk {
         };
         for i in self.leader.load(Ordering::Relaxed).. {
             let i = i % self.servers.len();
-            match block_on(self.servers[i].put_append(&arg)) {
-                Err(e) => panic!("{:?}", e),
+            debug!("{:?} ->{} {:?}", self, i, arg);
+            match block_on(timeout(self.servers[i].put_append(&arg))) {
+                Err(e) => {
+                    debug!("{:?} <-{} {:?}", self, i, e);
+                    continue;
+                }
                 Ok(PutAppendReply { wrong_leader, .. }) if wrong_leader => {
                     debug!("{:?} <-{} wrong leader", self, i);
                     if i == self.servers.len() - 1 {
@@ -121,5 +130,15 @@ impl Clerk {
 
     pub fn append(&self, key: String, value: String) {
         self.put_append(ClientOp::Append(key, value))
+    }
+}
+
+async fn timeout<F, T>(f: F) -> labrpc::Result<T>
+where
+    F: Future<Output = labrpc::Result<T>>,
+{
+    select! {
+        ret = f.fuse() => ret,
+        _ = futures_timer::Delay::new(Duration::from_millis(500)).fuse() => Err(labrpc::Error::Timeout),
     }
 }
