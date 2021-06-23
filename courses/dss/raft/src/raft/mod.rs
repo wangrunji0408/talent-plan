@@ -3,6 +3,7 @@ use futures::{
     stream::FuturesUnordered,
 };
 use std::{
+    collections::HashMap,
     fmt,
     ops::{Index, RangeFrom},
     sync::{Arc, Mutex, Weak},
@@ -34,6 +35,10 @@ pub enum ApplyMsg {
         data: Vec<u8>,
         term: u64,
         index: u64,
+    },
+    // For read-only optimization
+    Read {
+        id: u64,
     },
 }
 
@@ -179,6 +184,9 @@ pub struct Raft {
     match_index: Vec<usize>,
 
     last_apply_entries_received: Instant,
+    // { id -> bitmap of nodes that received ack }
+    reads: HashMap<u64, u32>,
+    first_index_of_this_term: usize,
 }
 
 macro_rules! try_upgrade {
@@ -235,6 +243,8 @@ impl Raft {
             next_index: vec![0; n],
             match_index: vec![0; n],
             last_apply_entries_received: Instant::now(),
+            reads: HashMap::new(),
+            first_index_of_this_term: 0,
         }));
 
         let mut raft = rf.lock().unwrap();
@@ -309,6 +319,34 @@ impl Raft {
         Ok((index, term))
     }
 
+    fn start_read(&mut self, id: u64) -> Result<()> {
+        if !self.state.is_leader() {
+            return Err(Error::NotLeader);
+        }
+        self.reads.insert(id, 0);
+        info!("{:?} start read {}", self, id);
+        Ok(())
+    }
+
+    fn ack_from(&mut self, i: usize) {
+        assert!(self.state.is_leader());
+        if self.commit_index < self.first_index_of_this_term {
+            return;
+        }
+        let mut complete_ids = vec![];
+        for (&id, bitmap) in self.reads.iter_mut() {
+            *bitmap |= 1 << i;
+            if bitmap.count_ones() as usize >= self.peers.len() / 2 {
+                complete_ids.push(id);
+            }
+        }
+        for id in complete_ids {
+            info!("{:?} complete read {}", self, id);
+            self.reads.remove(&id);
+            self.apply_ch.unbounded_send(ApplyMsg::Read { id }).unwrap();
+        }
+    }
+
     fn kill(&mut self) {
         self.killed = true;
         info!("{:?} killed", self);
@@ -321,6 +359,7 @@ impl Raft {
             self.voted_for = None;
         }
         self.state = State { term, role };
+        self.reads.clear();
         match role {
             Role::Follower => {
                 self.last_apply_entries_received = Instant::now();
@@ -333,6 +372,9 @@ impl Raft {
             Role::Leader => {
                 self.next_index.fill(self.log.len());
                 self.match_index.fill(0);
+                info!("{:?} start index {} (no-op)", self, self.log.len());
+                self.first_index_of_this_term = self.log.len();
+                self.log.push(Log { term, data: vec![] });
                 self.spawn_leader_append_entries();
             }
         }
@@ -485,6 +527,7 @@ impl Raft {
                                 this.transfer_state(reply.term, Role::Follower, "higher term (->IS)");
                                 return;
                             }
+                            this.ack_from(i);
                             this.next_index[i] = match_index_if_success + 1;
                             this.match_index[i] = match_index_if_success;
                             this.update_commit_from_match();
@@ -507,6 +550,7 @@ impl Raft {
                                 this.transfer_state(reply.term, Role::Follower, "higher term (->AE)");
                                 return;
                             }
+                            this.ack_from(i);
                             if reply.success {
                                 // If successful: update nextIndex and matchIndex for follower (§5.3)
                                 this.next_index[i] = match_index_if_success + 1;
@@ -569,7 +613,7 @@ impl Raft {
                         term: self.log[i].term,
                     })
                     .unwrap();
-            } else {
+            } else if !self.log[i].data.is_empty() {
                 self.apply_ch
                     .unbounded_send(ApplyMsg::Command {
                         data: self.log[i].data.clone(),
@@ -674,6 +718,11 @@ impl Node {
         // Your code here.
         let mut raft = self.raft.lock().unwrap();
         raft.start(command)
+    }
+
+    pub fn start_read(&self, id: u64) -> Result<()> {
+        let mut raft = self.raft.lock().unwrap();
+        raft.start_read(id)
     }
 
     /// The current term of this peer.
