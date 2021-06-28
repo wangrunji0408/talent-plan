@@ -22,9 +22,11 @@ impl Clerk {
         crate::your_code_here((name, servers))
     }
 
-    pub fn query(&self, num: usize) -> Config {
+    pub fn query(&self, num: Option<u64>) -> Config {
         // Your code here.
-        let args = QueryRequest { num: num as u64 };
+        let args = QueryRequest {
+            num: num.unwrap_or(u64::MAX),
+        };
         loop {
             // try each known server.
             for server in &self.servers {

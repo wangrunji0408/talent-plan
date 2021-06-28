@@ -64,4 +64,15 @@ pub mod shardctrlerpb {
         add_service as add_shardctrler_service, Client as ShardCtrlerClient,
         Service as ShardCtrlerService,
     };
+
+    #[cfg(test)]
+    impl Config {
+        pub fn get_servers(&self, gid: u64) -> &[String] {
+            self.groups
+                .iter()
+                .find(|g| g.gid == gid)
+                .map(|g| &g.servers)
+                .unwrap()
+        }
+    }
 }
