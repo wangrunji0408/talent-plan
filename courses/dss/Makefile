@@ -8,7 +8,7 @@ check:
 	cargo fmt --all -- --check
 	cargo clippy --all --tests -- -D clippy::all
 
-test: test_others test_2 test_3
+test: test_others test_2 test_3 test_4
 
 test_2: test_2a test_2b test_2c test_2d
 
@@ -25,6 +25,12 @@ test_3: test_3a test_3b
 test_3a: cargo_test_3a
 
 test_3b: cargo_test_3b
+
+test_4: test_4a test_4b
+
+test_4a: cargo_test_4a
+
+test_4b: cargo_test_4b
 
 cargo_test_%: check
 	RUST_LOG=${LOG_LEVEL} cargo test -p raft -- --nocapture --test $*

@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package shardctrlerpb;
+
+// A configuration -- an assignment of shards to groups.
+// Please don't change this.
+message Config {
+    // config number
+    uint64 num = 1;
+    // shard -> gid
+    repeated uint64 shards = 2;
+    // gid -> servers[]
+    repeated Group groups = 3;
+}
+
+message Group {
+    uint64 gid = 1;
+    repeated string servers = 2;
+}
+
+message JoinRequest {
+    // new GID -> servers mappings
+    repeated Group groups = 3;
+}
+
+message JoinReply {
+    bool wrong_leader = 1;
+    string err = 2;
+}
+
+message LeaveRequest {
+    repeated uint64 gids = 1;
+}
+
+message LeaveReply {
+    bool wrong_leader = 1;
+    string err = 2;
+}
+
+message MoveRequest {
+    uint64 shard = 1;
+    uint64 gid = 2;
+}
+
+message MoveReply {
+    bool wrong_leader = 1;
+    string err = 2;
+}
+
+message QueryRequest {
+    // desired config number
+    uint64 num = 1;
+}
+
+message QueryReply {
+    bool wrong_leader = 1;
+    string err = 2;
+    Config config = 3;
+}
